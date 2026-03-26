@@ -1,0 +1,36 @@
+# OpenClaw consumer example — shows how an OpenClaw agent connects to
+# browser-auth-sidecar for authenticated web access via CDP.
+#
+# Prerequisites:
+#   1. browser-auth-sidecar running (cd ../../ && docker compose up -d)
+#   2. Log into the target service via noVNC (https://127.0.0.1:6901)
+#   3. Export session: python scripts/export_session.py my-service --cdp-url http://localhost:9223
+#   4. Configure browser-profile.json with the CDP endpoint
+#
+# The OpenClaw container joins the sidecar network and accesses
+# the browser via CDP at browser-auth-browser:9223.
+
+services:
+  openclaw-agent:
+    image: ghcr.io/nichochar/openclaw:latest
+    container_name: openclaw-consumer
+    environment:
+      HOME: /home/node
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+    volumes:
+      - ./config:/home/node/.openclaw
+      - ${BAS_SHARED_DIR:-../../data/shared}:/shared/browser-auth
+    ports:
+      - "127.0.0.1:18791:18791"
+    networks:
+      - browser-auth
+    init: true
+    restart: unless-stopped
+    command:
+      ["node", "openclaw.mjs", "gateway", "--allow-unconfigured", "--bind", "lan"]
+
+networks:
+  browser-auth:
+    name: ${BAS_NETWORK:-browser-auth-net}
+    external: true

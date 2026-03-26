@@ -1,0 +1,36 @@
+services:
+  browser:
+    image: kasmweb/chrome:1.16.1
+    container_name: ${BAS_CONTAINER_PREFIX:-browser-auth}-browser
+    shm_size: '2g'
+    environment:
+      VNC_PW: ${BAS_VNC_PASSWORD}
+    ports:
+      - "127.0.0.1:${BAS_NOVNC_PORT:-6901}:6901"   # noVNC — localhost only
+    volumes:
+      - ${BAS_PROFILE_DIR:-./data/kasm-profile}:/home/kasm-user
+      - ${BAS_SHARED_DIR:-./data/shared}:/shared/browser-auth
+      - ./chrome-wrapper.sh:/usr/bin/google-chrome:ro
+    networks:
+      browser-auth:
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "ss -tlnp | grep -q ':6901'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  cdp-proxy:
+    image: alpine/socat:1.8.0.1
+    container_name: ${BAS_CONTAINER_PREFIX:-browser-auth}-cdp-proxy
+    command: TCP-LISTEN:${BAS_CDP_PORT:-9223},fork,reuseaddr TCP:127.0.0.1:9222
+    network_mode: "service:browser"
+    depends_on:
+      browser:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  browser-auth:
+    name: ${BAS_NETWORK:-browser-auth-net}

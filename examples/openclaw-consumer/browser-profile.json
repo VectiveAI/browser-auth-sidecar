@@ -1,0 +1,7 @@
+{
+  "_comment": "Template CDP browser profile for OpenClaw. Copy to your OpenClaw config directory and adjust values.",
+  "cdpUrl": "ws://browser-auth-browser:9223",
+  "sharedDir": "/shared/browser-auth",
+  "sessionHealthPath": "/shared/browser-auth/meta/session-health.json",
+  "playwrightStoragePath": "/shared/browser-auth/playwright"
+}

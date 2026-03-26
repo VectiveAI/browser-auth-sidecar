@@ -1,0 +1,31 @@
+# Basic consumer example — a Python container that connects to
+# browser-auth-sidecar via Chrome DevTools Protocol (CDP).
+#
+# Usage:
+#   1. Start the sidecar:  cd ../../ && docker compose up -d
+#   2. Start this consumer: docker compose up
+#
+# The consumer joins the sidecar's network and reaches CDP at
+# browser-auth-browser:9223 (the socat proxy port).
+
+services:
+  consumer:
+    image: python:3.12-slim
+    container_name: basic-consumer
+    working_dir: /app
+    volumes:
+      - ./test_connection.py:/app/test_connection.py:ro
+      - ${BAS_SHARED_DIR:-../../data/shared}:/shared/browser-auth
+    environment:
+      BAS_SHARED_DIR: /shared/browser-auth
+      BAS_CDP_HOST: ${BAS_CONTAINER_PREFIX:-browser-auth}-browser
+      BAS_CDP_PORT: ${BAS_CDP_PORT:-9223}
+    command: ["python", "test_connection.py"]
+    networks:
+      - browser-auth
+    depends_on: []
+
+networks:
+  browser-auth:
+    name: ${BAS_NETWORK:-browser-auth-net}
+    external: true
