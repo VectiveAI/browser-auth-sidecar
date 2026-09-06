@@ -11,6 +11,13 @@ Why: Chrome 131+ binds CDP to 127.0.0.1 and Chrome has no auth on CDP.
 Binding to the Tailscale IP + a per-connection token gate keeps the
 browser controllable only from the tailnet with the secret.
 
+Discovery requests (GET /json/version, /json/list, /json) go through the
+same auth gate as everything else, but their JSON body is rewritten:
+Chrome self-reports its own loopback address in fields like
+webSocketDebuggerUrl, which is unreachable from anywhere but this host.
+Those occurrences are rewritten to this proxy's own externally-reachable
+BAS_TAILNET_IP:BAS_CDP_PORT before the response is returned.
+
 Stdlib only. Python 3.9+.
 """
 import os
@@ -51,6 +58,54 @@ def _strip_secret(buf: bytes) -> bytes:
     return b"\r\n".join(lines) + sep + rest
 
 
+def _is_discovery_request(first: bytes) -> bool:
+    line = first.split(b"\r\n", 1)[0]
+    parts = line.split(b" ")
+    if len(parts) < 2 or parts[0] != b"GET":
+        return False
+    path = parts[1].split(b"?", 1)[0]
+    return path in (b"/json/version", b"/json/list", b"/json")
+
+
+def _read_http_response(sock: socket.socket, timeout: float = 10) -> bytes:
+    sock.settimeout(timeout)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return buf
+        buf += chunk
+        if len(buf) > 1 << 20:
+            return buf
+    head, sep, body = buf.partition(b"\r\n\r\n")
+    m = re.search(rb"(?i)content-length:\s*(\d+)", head)
+    if m:
+        need = int(m.group(1))
+        while len(body) < need:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+    return head + sep + body
+
+
+def _rewrite_discovery_response(raw: bytes) -> bytes:
+    head, sep, body = raw.partition(b"\r\n\r\n")
+    if not sep:
+        return raw
+    old_loopback = f"127.0.0.1:{UPSTREAM[1]}".encode()
+    old_localhost = f"localhost:{UPSTREAM[1]}".encode()
+    new_target = f"{BIND}:{PORT}".encode()
+    new_body = body.replace(old_loopback, new_target).replace(old_localhost, new_target)
+    if new_body != body:
+        head = re.sub(
+            rb"(?i)content-length:\s*\d+",
+            b"Content-Length: " + str(len(new_body)).encode(),
+            head,
+        )
+    return head + sep + new_body
+
+
 def _pipe(a: socket.socket, b: socket.socket, stop: threading.Event):
     try:
         while not stop.is_set():
@@ -87,6 +142,20 @@ def handle(conn: socket.socket, addr):
         return
 
     conn.settimeout(None)
+
+    if _is_discovery_request(first):
+        try:
+            up = socket.create_connection(UPSTREAM, timeout=10)
+            up.sendall(_strip_secret(first))
+            raw = _read_http_response(up)
+            up.close()
+        except OSError:
+            conn.close()
+            return
+        conn.sendall(_rewrite_discovery_response(raw))
+        conn.close()
+        return
+
     up = socket.create_connection(UPSTREAM, timeout=10)
     up.sendall(_strip_secret(first))
     stop = threading.Event()
