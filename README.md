@@ -1,6 +1,6 @@
 # Browser Auth Sidecar
 
-A Docker Compose pattern that gives container-isolated AI agents authenticated access to web services that lack API-level authentication. A persistent Chrome instance runs inside a KasmVNC container with noVNC for human login, and a socat CDP proxy makes the authenticated browser controllable by any container on the shared Docker network.
+A Docker Compose pattern that gives container-isolated AI agents authenticated access to web services that lack API-level authentication. A persistent Chrome instance runs inside a KasmVNC container with noVNC for human login, and a grants-aware CDP proxy makes the authenticated browser controllable by any container on the shared Docker network that presents a currently-valid per-agent grant.
 
 ## Architecture
 
@@ -8,16 +8,21 @@ A Docker Compose pattern that gives container-isolated AI agents authenticated a
 +-------------+     +--------------------------+     +------------------+
 |   Human     |     |  browser container       |     |  consumer        |
 |   (noVNC)   +---->|  kasmweb/chrome:1.16.1   |<----+  (your AI agent) |
-| :6901       |     |  Chrome + CDP :9222      |     |  CDP :9223       |
-| localhost   |     +-----------+--------------+     +------------------+
-|  only       |                 |
+| :6901       |     |  Chrome + CDP :9222      |     |  CDP :9223,      |
+| localhost   |     +-----------+--------------+     |  bas_token=...   |
+|  only       |                 |                    +------------------+
 +-------------+     +-----------+--------------+
                     |  cdp-proxy container     |
-                    |  alpine/socat            |
+                    |  grants-aware Python     |
                     |  :9223 -> 127.0.0.1:9222 |
                     |  network_mode:           |
                     |    service:browser       |
-                    +--------------------------+
+                    +-----------+--------------+
+                                |
+                                | outbound poll, ~1s
+                                v
+                    GET /api/v1/providers/{id}/grants
+                              (Maestro)
 
         Shared volume: /shared/browser-auth/
         +-- meta/session-health.json
@@ -25,7 +30,7 @@ A Docker Compose pattern that gives container-isolated AI agents authenticated a
         +-- playwright/<service>.json
 ```
 
-The CDP proxy exists because Chrome 131+ silently ignores `--remote-debugging-address=0.0.0.0` and always binds to `127.0.0.1`. The socat sidecar shares the browser's network namespace and forwards CDP traffic to other containers.
+The CDP proxy exists because Chrome 131+ silently ignores `--remote-debugging-address=0.0.0.0` and always binds to `127.0.0.1`. The sidecar shares the browser's network namespace and forwards CDP traffic to other containers -- but only once a connection presents a valid grant token. See `docs/architecture.md` for the full grants model (source of truth, real-time revoke, why `service_name` isn't a sandbox).
 
 ## Quickstart
 
@@ -52,17 +57,21 @@ python scripts/export_session.py my-service --cdp-url http://localhost:9223
 python scripts/update_health.py my-service --ttl 24
 ```
 
-Your AI agent container joins the `browser-auth-net` network and connects via CDP:
+Your AI agent container joins the `browser-auth-net` network and connects via CDP, presenting its grant's bearer token (issued through Maestro -- see `docs/architecture.md` "Grants (per-agent CDP access)"):
 
 ```python
 # From inside a consumer container
 from playwright.async_api import async_playwright
 
 async with async_playwright() as p:
-    browser = await p.chromium.connect_over_cdp("ws://browser-auth-browser:9223")
+    browser = await p.chromium.connect_over_cdp(
+        "ws://browser-auth-browser:9223?bas_token=<your grant's token>"
+    )
     page = browser.contexts[0].pages[0]
     # The page is already authenticated
 ```
+
+A connection with no token, an unknown token, or a revoked/expired grant is rejected with `401`. There is no unauthenticated access to CDP in docker mode.
 
 ## Configuration
 
@@ -77,6 +86,12 @@ All configuration uses environment variables with the `BAS_` prefix.
 | `BAS_PROFILE_DIR` | `./data/kasm-profile` | Host path for Chrome profile persistence |
 | `BAS_SHARED_DIR` | `./data/shared` | Host path for shared session data |
 | `BAS_NETWORK` | `browser-auth-net` | Docker network name |
+| `BAS_MAESTRO_PROVIDER_ID` | *(required for grants)* | This host's provider id, issued at Maestro registration |
+| `BAS_MAESTRO_PROVIDER_TOKEN` | *(required for grants)* | This host's own registration credential -- also used to authenticate the grants poll |
+| `BAS_MAESTRO_API_URL` | `https://maestro.vectiveai.com` | Maestro API base URL |
+| `BAS_GRANTS_POLL_INTERVAL` | `1` | Seconds between grants polls |
+
+Until the two required grants variables are set, `cdp-proxy` runs and refuses every connection rather than falling back to open access -- see `docs/architecture.md`.
 
 ## Session Management
 
@@ -114,7 +129,7 @@ All scripts accept `--shared-dir` to override the `BAS_SHARED_DIR` environment v
 ## Security Model
 
 - **noVNC**: Bound to `127.0.0.1` only. Access via SSH tunnel or VPN. Never exposed publicly.
-- **CDP**: Internal to the Docker network. Not port-mapped to the host. Only containers on `browser-auth-net` can reach it.
+- **CDP**: Internal to the Docker network. Not port-mapped to the host. Being joined to `browser-auth-net` is necessary but not sufficient -- every connection also needs a currently-valid grant token. Revocation closes an already-open connection within one poll cycle, not just future ones.
 - **Session files**: Written with `0600` permissions. Treat the shared volume as sensitive data.
 - **Chrome profile**: Contains cached credentials. Protect the host directory.
 
@@ -144,10 +159,12 @@ networks:
 From inside the consumer container, CDP is available at:
 
 ```
-ws://<BAS_CONTAINER_PREFIX>-browser:<BAS_CDP_PORT>
+ws://<BAS_CONTAINER_PREFIX>-browser:<BAS_CDP_PORT>?bas_token=<your grant's token>
 ```
 
-With defaults: `ws://browser-auth-browser:9223`
+With defaults: `ws://browser-auth-browser:9223?bas_token=...`
+
+The token can also be presented as `Authorization: Bearer <token>` instead of a query parameter. Either way it's stripped before the request reaches Chrome, and it must correspond to a grant that is currently issued, not revoked, and not expired -- see `docs/architecture.md` "Grants (per-agent CDP access)" for how grants are issued and how revocation is enforced.
 
 See `examples/` for complete consumer setups.
 
@@ -158,11 +175,12 @@ See `examples/` for complete consumer setups.
 
 ## Known Limitations
 
-- **Chrome CDP binding bug**: Chrome 131+ ignores `--remote-debugging-address=0.0.0.0`. The socat sidecar is the workaround. This is a [known Chromium issue](https://issues.chromium.org/issues/issues).
+- **Chrome CDP binding bug**: Chrome 131+ ignores `--remote-debugging-address=0.0.0.0`. The proxy sidecar is the workaround. This is a [known Chromium issue](https://issues.chromium.org/issues/issues).
+- **`service_name` is not a CDP sandbox**: a grant governs who may connect and for how long, not what a connected agent can technically touch -- CDP has no per-origin restriction mechanism. See `docs/architecture.md`.
 - **Server-side sessions**: Services that store sessions entirely server-side (opaque session IDs) cannot be meaningfully exported via Playwright storage_state. These require live CDP access to the browser instance.
 - **Manual login required**: Initial authentication must be performed by a human via noVNC. Automated login is not included (and is fragile for services with CAPTCHAs, 2FA, etc.).
 - **Single browser instance**: The pattern runs one Chrome instance. Multiple concurrent authenticated services share the same browser profile.
-- **KasmVNC startup hooks**: `kasm_post_run_root.sh` is unreliable for custom scripts. The socat sidecar pattern is intentional.
+- **KasmVNC startup hooks**: `kasm_post_run_root.sh` is unreliable for custom scripts. The sidecar-proxy pattern is intentional.
 
 ## Contributing
 

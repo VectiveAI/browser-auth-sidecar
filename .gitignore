@@ -1,1 +1,3 @@
 native/.env
+__pycache__/
+*.pyc
