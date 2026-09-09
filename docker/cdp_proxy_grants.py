@@ -45,6 +45,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 
 BIND = os.environ.get("BAS_TAILNET_IP", "0.0.0.0")
 PORT = int(os.environ.get("BAS_CDP_PORT", "9223"))
@@ -57,6 +58,15 @@ PROVIDER_TOKEN = os.environ.get("BAS_MAESTRO_PROVIDER_TOKEN", "")
 POLL_INTERVAL = float(os.environ.get("BAS_GRANTS_POLL_INTERVAL", "1"))
 POLL_TIMEOUT = float(os.environ.get("BAS_GRANTS_POLL_TIMEOUT", "5"))
 UNCONFIGURED_RETRY = float(os.environ.get("BAS_GRANTS_UNCONFIGURED_RETRY", "30"))
+
+# Same shared volume and JSONL schema as scripts/audit.py (timestamp/event/
+# service/result/source), extended with optional grant_id/consumer_identity.
+# Reimplemented here rather than imported: this file is the only thing
+# mounted into the cdp-proxy container (docker-compose.yml mounts just
+# cdp_proxy_grants.py, not the rest of the repo), so scripts/audit.py is
+# not importable from inside it.
+SHARED_DIR = os.environ.get("BAS_SHARED_DIR", "/shared/browser-auth")
+AUDIT_LOG = os.path.join(SHARED_DIR, "meta", "audit.log")
 
 _lock = threading.Lock()
 _grants_by_hash = {}          # token_hash -> grant record
@@ -72,6 +82,31 @@ def _grants_url(provider_id: str) -> str:
 
 def _now():
     return datetime.now(timezone.utc)
+
+
+def _audit(event_type: str, service: str, result: str, grant_id: str = None,
+           consumer_identity: str = None, source: str = "cdp_proxy_grants.py"):
+    """Append one structured audit entry. Never raises -- a failure to
+    write the audit trail (e.g. the shared volume isn't mounted) must not
+    take down connection handling or the poll loop, the same posture the
+    rest of this file already takes toward its own I/O failures."""
+    entry = {
+        "timestamp": _now().isoformat(),
+        "event": event_type,
+        "service": service,
+        "result": result,
+        "source": source,
+    }
+    if grant_id is not None:
+        entry["grant_id"] = grant_id
+    if consumer_identity is not None:
+        entry["consumer_identity"] = consumer_identity
+    try:
+        Path(AUDIT_LOG).parent.mkdir(parents=True, exist_ok=True)
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as exc:
+        print(f"cdp_proxy: audit write failed: {exc}", flush=True)
 
 
 def _is_dead(grant: dict) -> bool:
@@ -132,17 +167,34 @@ def _poll_once():
         new_dead_by_id[g["grant_id"]] = _is_dead(g)
 
     with _lock:
+        had_prior_poll = _poll_ok.is_set()
+        prev_by_id = _grants_by_id
         prev_dead_by_id = _dead_by_id
         _grants_by_hash = new_by_hash
         _grants_by_id = new_by_id
         _dead_by_id = new_dead_by_id
     _poll_ok.set()
 
+    # A grant present already on the FIRST poll is the proxy catching up on
+    # pre-existing state, not a fresh issuance -- only audit transitions
+    # observed after that baseline, the same distinction _is_dead already
+    # makes for expiry (see comment above).
+    if had_prior_poll:
+        for grant_id, grant in new_by_id.items():
+            if grant_id not in prev_by_id:
+                _audit("grant_issued", grant.get("service_name", ""), "observed",
+                       grant_id=grant_id, consumer_identity=grant.get("consumer_identity"))
+
     for grant_id in set(prev_dead_by_id) | set(new_dead_by_id):
         was_dead = prev_dead_by_id.get(grant_id, False)
         now_dead = new_dead_by_id.get(grant_id, True)  # disappeared (purged) counts as dead
         if now_dead and not was_dead:
             _close_live_sockets(grant_id)
+            if had_prior_poll:
+                grant = new_by_id.get(grant_id) or prev_by_id.get(grant_id) or {}
+                if grant.get("revoked_at"):
+                    _audit("grant_revoked", grant.get("service_name", ""), "observed",
+                           grant_id=grant_id, consumer_identity=grant.get("consumer_identity"))
 
 
 def _poll_loop():
@@ -288,9 +340,13 @@ def handle(conn: socket.socket, addr):
 
     grant = _auth_grant(first)
     if grant is None:
+        _audit("connection_rejected", "unknown", "unauthorized")
         conn.sendall(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
         conn.close()
         return
+
+    _audit("connection_accepted", grant.get("service_name", ""), "success",
+           grant_id=grant.get("grant_id"), consumer_identity=grant.get("consumer_identity"))
 
     conn.settimeout(None)
 

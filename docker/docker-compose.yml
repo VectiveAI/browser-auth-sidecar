@@ -40,6 +40,12 @@ services:
       BAS_GRANTS_POLL_INTERVAL: ${BAS_GRANTS_POLL_INTERVAL:-1}
     volumes:
       - ./cdp_proxy_grants.py:/opt/cdp_proxy_grants.py:ro
+      # Same host directory as the browser service above -- audit.log
+      # writes (connection_accepted/rejected, grant_issued/revoked) need
+      # to land in the one shared audit trail, not a container-local path
+      # that vanishes with the container. network_mode: service:browser
+      # shares the network namespace only, never volumes.
+      - ${BAS_SHARED_DIR:-./data/shared}:/shared/browser-auth
     network_mode: "service:browser"
     depends_on:
       browser:
