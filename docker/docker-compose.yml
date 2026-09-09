@@ -22,9 +22,30 @@ services:
       start_period: 15s
 
   cdp-proxy:
-    image: alpine/socat:1.8.0.1
+    image: python:3.12-alpine
     container_name: ${BAS_CONTAINER_PREFIX:-browser-auth}-cdp-proxy
-    command: TCP-LISTEN:${BAS_CDP_PORT:-9223},fork,reuseaddr TCP:127.0.0.1:9222
+    command: ["python3", "/opt/cdp_proxy_grants.py"]
+    environment:
+      BAS_TAILNET_IP: ${BAS_TAILNET_IP:-0.0.0.0}
+      BAS_CDP_PORT: ${BAS_CDP_PORT:-9223}
+      BAS_CHROME_CDP_PORT: ${BAS_CHROME_CDP_PORT:-9222}
+      # Grants source of truth -- see BAS_MAESTRO_* in .env.sample. Until a
+      # provider_id and provider token exist (this host is registered with
+      # Maestro), the proxy runs, polls, gets nothing, and refuses every
+      # connection -- it does not fail open and does not fall back to any
+      # local file.
+      BAS_MAESTRO_API_URL: ${BAS_MAESTRO_API_URL:-https://maestro.vectiveai.com}
+      BAS_MAESTRO_PROVIDER_ID: ${BAS_MAESTRO_PROVIDER_ID:-}
+      BAS_MAESTRO_PROVIDER_TOKEN: ${BAS_MAESTRO_PROVIDER_TOKEN:-}
+      BAS_GRANTS_POLL_INTERVAL: ${BAS_GRANTS_POLL_INTERVAL:-1}
+    volumes:
+      - ./cdp_proxy_grants.py:/opt/cdp_proxy_grants.py:ro
+      # Same host directory as the browser service above -- audit.log
+      # writes (connection_accepted/rejected, grant_issued/revoked) need
+      # to land in the one shared audit trail, not a container-local path
+      # that vanishes with the container. network_mode: service:browser
+      # shares the network namespace only, never volumes.
+      - ${BAS_SHARED_DIR:-./data/shared}:/shared/browser-auth
     network_mode: "service:browser"
     depends_on:
       browser:
