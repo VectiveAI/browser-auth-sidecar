@@ -581,9 +581,15 @@ class TestAuditLogging(unittest.TestCase):
     """The design (decision c453ccc8 on task 5fc24712) promises audit.log
     entries for grant_issued, grant_revoked, connection_accepted and
     connection_rejected. None of the four existed in the deployed proxy
-    (vault's third-reader finding, entry c542c6a1 on task 5fc24712) --
-    these assert the writes happen, not just that a capability to write
-    them exists."""
+    (vault's third-reader finding, entry c542c6a1 on task 5fc24712).
+
+    Scope narrowed per task 0522d178 entry 4245b980 (independently
+    verified against PR #199 on VectiveAI/maestro, which writes
+    grant_issued/grant_revoked server-side via Maestro's own issuance/
+    revocation endpoints, tested there): the proxy never issues or
+    revokes a grant, only enforces one, so only connection_accepted and
+    connection_rejected -- the two events only the proxy can observe --
+    belong here."""
 
     def setUp(self):
         self.maestro = FakeMaestro()
@@ -629,67 +635,6 @@ class TestAuditLogging(unittest.TestCase):
 
         entries = [e for e in _read_audit_log(self.shared_dir) if e["event"] == "connection_rejected"]
         self.assertTrue(entries, "no connection_rejected audit entry was written")
-
-    def test_grant_revoked_is_audited(self):
-        grant, token = make_grant(service_name="svc-x")
-        self.maestro.set_grants([grant])
-        self.harness = ProxyHarness(self.maestro, self.upstream, poll_interval="0.1",
-                                     shared_dir=self.shared_dir)
-        self.harness.wait_polled()
-
-        revoked = dict(grant)
-        revoked["revoked_at"] = datetime.now(timezone.utc).isoformat()
-        self.maestro.set_grants([revoked])
-
-        deadline = time.time() + 2
-        entries = []
-        while time.time() < deadline:
-            entries = [e for e in _read_audit_log(self.shared_dir) if e["event"] == "grant_revoked"]
-            if entries:
-                break
-            time.sleep(0.05)
-        self.assertTrue(entries, "no grant_revoked audit entry was written")
-        self.assertEqual(entries[0]["grant_id"], grant["grant_id"])
-        self.assertEqual(entries[0]["service"], "svc-x")
-
-    def test_grant_issued_is_audited_for_a_new_grant_seen_after_startup(self):
-        """A grant present already on the proxy's very first poll is the
-        proxy catching up on pre-existing state, not a fresh issuance --
-        only a grant that appears in a LATER poll (a real transition) is
-        audited as grant_issued."""
-        self.maestro.set_grants([])
-        self.harness = ProxyHarness(self.maestro, self.upstream, poll_interval="0.1",
-                                     shared_dir=self.shared_dir)
-        self.harness.wait_polled()
-
-        grant, _token = make_grant(service_name="svc-new")
-        self.maestro.set_grants([grant])
-
-        deadline = time.time() + 2
-        entries = []
-        while time.time() < deadline:
-            entries = [e for e in _read_audit_log(self.shared_dir) if e["event"] == "grant_issued"]
-            if entries:
-                break
-            time.sleep(0.05)
-        self.assertTrue(entries, "no grant_issued audit entry was written")
-        self.assertEqual(entries[0]["grant_id"], grant["grant_id"])
-        self.assertEqual(entries[0]["service"], "svc-new")
-
-    def test_grant_issued_not_audited_for_grant_already_present_on_first_poll(self):
-        grant, _token = make_grant(service_name="svc-preexisting")
-        self.maestro.set_grants([grant])
-        self.harness = ProxyHarness(self.maestro, self.upstream, poll_interval="0.1",
-                                     shared_dir=self.shared_dir)
-        self.harness.wait_polled()
-
-        time.sleep(0.5)  # let a few more poll cycles pass over the same, unchanged grant
-
-        entries = [e for e in _read_audit_log(self.shared_dir) if e["event"] == "grant_issued"]
-        self.assertFalse(
-            entries,
-            "a grant present on the proxy's first poll was wrongly audited as freshly issued",
-        )
 
 
 if __name__ == "__main__":

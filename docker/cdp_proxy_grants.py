@@ -167,34 +167,17 @@ def _poll_once():
         new_dead_by_id[g["grant_id"]] = _is_dead(g)
 
     with _lock:
-        had_prior_poll = _poll_ok.is_set()
-        prev_by_id = _grants_by_id
         prev_dead_by_id = _dead_by_id
         _grants_by_hash = new_by_hash
         _grants_by_id = new_by_id
         _dead_by_id = new_dead_by_id
     _poll_ok.set()
 
-    # A grant present already on the FIRST poll is the proxy catching up on
-    # pre-existing state, not a fresh issuance -- only audit transitions
-    # observed after that baseline, the same distinction _is_dead already
-    # makes for expiry (see comment above).
-    if had_prior_poll:
-        for grant_id, grant in new_by_id.items():
-            if grant_id not in prev_by_id:
-                _audit("grant_issued", grant.get("service_name", ""), "observed",
-                       grant_id=grant_id, consumer_identity=grant.get("consumer_identity"))
-
     for grant_id in set(prev_dead_by_id) | set(new_dead_by_id):
         was_dead = prev_dead_by_id.get(grant_id, False)
         now_dead = new_dead_by_id.get(grant_id, True)  # disappeared (purged) counts as dead
         if now_dead and not was_dead:
             _close_live_sockets(grant_id)
-            if had_prior_poll:
-                grant = new_by_id.get(grant_id) or prev_by_id.get(grant_id) or {}
-                if grant.get("revoked_at"):
-                    _audit("grant_revoked", grant.get("service_name", ""), "observed",
-                           grant_id=grant_id, consumer_identity=grant.get("consumer_identity"))
 
 
 def _poll_loop():
