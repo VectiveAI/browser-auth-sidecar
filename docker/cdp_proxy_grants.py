@@ -29,9 +29,16 @@ Revoke touches only the one grant's own token_hash and its own live
 sockets. It never reaches the browser container, noVNC, or
 session-health.json -- those stay entirely orthogonal to grant state.
 
-Until the first successful poll (or whenever polling is failing), the
-proxy has no grants to check against and so authorizes nothing -- fail
-closed, never fail open.
+Until the first successful poll, and again whenever the most recent
+successful poll is older than STALE_AFTER seconds, the proxy authorizes
+nothing -- fail closed, never fail open. A poll is successful only when
+Maestro answers HTTP 200 with a JSON object; a 401, a 500, any other
+status, a redirect, a malformed body, a truncated read or an unreachable
+Maestro is a failure. Failure does not clear the cached index (one missed
+poll must not close every live grant); it simply stops the cache from
+being trusted once it is too old to say a revoke has not happened.
+Connections already open when the bound passes are left to the next
+successful poll to close; only new connections are gated by freshness.
 
 Stdlib only. Python 3.9+.
 """
@@ -57,6 +64,19 @@ PROVIDER_ID = os.environ.get("BAS_MAESTRO_PROVIDER_ID", "")
 PROVIDER_TOKEN = os.environ.get("BAS_MAESTRO_PROVIDER_TOKEN", "")
 POLL_INTERVAL = float(os.environ.get("BAS_GRANTS_POLL_INTERVAL", "1"))
 POLL_TIMEOUT = float(os.environ.get("BAS_GRANTS_POLL_TIMEOUT", "5"))
+# Longest a successful poll's data may be relied on. A poll's data is as of
+# the moment its request began. In the slowest healthy cadence every poll
+# takes nearly all of POLL_TIMEOUT and then sleeps POLL_INTERVAL, so
+# consecutive successes start about POLL_TIMEOUT + POLL_INTERVAL apart and
+# the newest data is at most that old plus one more slow poll when the next
+# refresh lands. Twice (interval + timeout) therefore tolerates one entirely
+# missed or timed-out poll without flapping, and refuses by the second. The
+# ceiling keeps the bound short whatever the poll settings are, because this
+# bound is the window in which a revoke made while Maestro is unreachable is
+# still honored. There is deliberately no setting that disables it or makes
+# it unbounded.
+_STALE_CEILING = 30.0
+STALE_AFTER = min(2 * (POLL_INTERVAL + POLL_TIMEOUT), _STALE_CEILING)
 UNCONFIGURED_RETRY = float(os.environ.get("BAS_GRANTS_UNCONFIGURED_RETRY", "30"))
 
 # Same shared volume and JSONL schema as scripts/audit.py (timestamp/event/
@@ -73,7 +93,9 @@ _grants_by_hash = {}          # token_hash -> grant record
 _grants_by_id = {}            # grant_id -> grant record (current poll's state)
 _dead_by_id = {}              # grant_id -> bool, dead-status AS OF the poll it was computed in
 _live_sockets = {}            # grant_id -> set of (conn, up, stop) currently open under it
-_poll_ok = threading.Event()  # set once at least one poll has completed successfully
+_poll_ok = threading.Event()  # set once at least one poll has completed successfully; never cleared -- freshness is _last_ok_at
+_last_ok_at = None            # _monotonic() at which the newest SUCCESSFUL poll's request began
+_monotonic = time.monotonic   # indirection so tests can drive the clock; production never reassigns it
 
 
 def _grants_url(provider_id: str) -> str:
@@ -125,14 +147,47 @@ def _is_dead(grant: dict) -> bool:
     return expiry <= _now()
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect from the grants endpoint is a failed poll, not something to
+    chase: following it would carry the provider bearer token to wherever the
+    Location header points and could answer 200 for a different resource."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
+class PollFailure(Exception):
+    """The grants poll did not return a usable 200 JSON-object response."""
+
+
 def _fetch_grants(provider_id: str, token: str) -> list:
     req = urllib.request.Request(
         _grants_url(provider_id),
         headers={"Authorization": f"Bearer {token}"},
     )
-    with urllib.request.urlopen(req, timeout=POLL_TIMEOUT) as resp:
+    with _opener.open(req, timeout=POLL_TIMEOUT) as resp:
+        if resp.status != 200:
+            raise PollFailure(f"HTTP {resp.status}")
         payload = json.loads(resp.read().decode("utf-8"))
-    return payload.get("grants", [])
+    if not isinstance(payload, dict):
+        raise PollFailure("body is not a JSON object")
+    grants = payload.get("grants")
+    if not isinstance(grants, list):
+        raise PollFailure("body has no grants list")
+    return grants
+
+
+def _poll_is_fresh_locked() -> bool:
+    """Caller holds _lock."""
+    return _last_ok_at is not None and (_monotonic() - _last_ok_at) <= STALE_AFTER
+
+
+def _poll_is_fresh() -> bool:
+    with _lock:
+        return _poll_is_fresh_locked()
 
 
 def _close_live_sockets(grant_id: str):
@@ -148,7 +203,8 @@ def _close_live_sockets(grant_id: str):
 
 
 def _poll_once():
-    global _grants_by_hash, _grants_by_id, _dead_by_id
+    global _grants_by_hash, _grants_by_id, _dead_by_id, _last_ok_at
+    started = _monotonic()
     grants = _fetch_grants(PROVIDER_ID, PROVIDER_TOKEN)
     new_by_hash = {}
     new_by_id = {}
@@ -171,6 +227,7 @@ def _poll_once():
         _grants_by_hash = new_by_hash
         _grants_by_id = new_by_id
         _dead_by_id = new_dead_by_id
+        _last_ok_at = started
     _poll_ok.set()
 
     for grant_id in set(prev_dead_by_id) | set(new_dead_by_id):
@@ -196,8 +253,16 @@ def _poll_loop():
             continue
         try:
             _poll_once()
-        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as exc:
-            print(f"cdp_proxy: grants poll failed: {exc}", flush=True)
+        except Exception as exc:  # any failure at all; this thread must outlive it
+            # Kind only: the exception text of a urllib or JSON error can
+            # carry request or response content, and this loop holds the
+            # provider bearer token.
+            kind = type(exc).__name__
+            if isinstance(exc, urllib.error.HTTPError):
+                kind = f"{kind} {exc.code}"
+            elif isinstance(exc, PollFailure):
+                kind = f"{kind} ({exc})"  # our own fixed strings, no payload content
+            print(f"cdp_proxy: grants poll failed: {kind}", flush=True)
         time.sleep(POLL_INTERVAL)
 
 
@@ -221,7 +286,7 @@ def _grant_for_presented_token(token: str):
 
 
 def _auth_grant(head: bytes):
-    if not _poll_ok.is_set():
+    if not _poll_is_fresh():
         return None
     token = _extract_token(head)
     if not token:
@@ -229,6 +294,12 @@ def _auth_grant(head: bytes):
     grant = _grant_for_presented_token(token)
     if grant is None or _is_dead(grant):
         return None
+    # service_name is deliberately NOT compared to anything here. This proxy
+    # fronts one shared browser profile and has no service identity of its
+    # own; the grants it polls are already scoped to this provider by the
+    # provider credential, and service_name is declared/audit scope (see
+    # docs/architecture.md). It is recorded in the audit log under each
+    # grant's own value.
     return grant
 
 
@@ -364,7 +435,7 @@ def handle(conn: socket.socket, addr):
         # and the next poll's diff (which only fires on a transition, and
         # would see no prior live-socket entry here to close).
         current = _grants_by_id.get(grant_id)
-        already_dead = current is None or _is_dead(current)
+        already_dead = current is None or _is_dead(current) or not _poll_is_fresh_locked()
         if already_dead:
             stop.set()
         else:
