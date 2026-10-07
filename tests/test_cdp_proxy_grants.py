@@ -8,6 +8,7 @@ Run: python3 test_cdp_proxy_grants.py
 import contextlib
 import hashlib
 import http.server
+import io
 import importlib
 import json
 import os
@@ -48,10 +49,26 @@ class FakeMaestro:
         self.grants = []
         self.lock = threading.Lock()
         self.seen_auth_headers = []
+        self.paths_seen = []
+        self.request_count = 0
+        # Response behaviour for the grants endpoint: "ok" (200 + grants),
+        # ("status", code), "redirect", "nonobject" (200, JSON array),
+        # "incomplete" (200, Content-Length longer than the body, then close).
+        self.mode = "ok"
+        self.server = None
+        self.thread = None
+        self.come_up()
+
+    def come_up(self):
         handler = self._make_handler()
         self.server = http.server.HTTPServer(("127.0.0.1", self.port), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
+
+    def go_down(self):
+        """Stop listening entirely so the proxy's poll sees a refused connection."""
+        self.server.shutdown()
+        self.server.server_close()
 
     def _make_handler(self):
         outer = self
@@ -59,8 +76,41 @@ class FakeMaestro:
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 outer.seen_auth_headers.append(self.headers.get("Authorization"))
+                outer.paths_seen.append(self.path)
+                outer.request_count += 1
                 with outer.lock:
                     body = json.dumps({"grants": list(outer.grants)}).encode()
+                    mode = outer.mode
+                if self.path.startswith("/redirected"):
+                    # What a followed redirect would land on: a perfectly
+                    # good 200 carrying the grants.
+                    mode = "ok"
+                elif mode == "redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/redirected")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                if isinstance(mode, tuple) and mode[0] == "status":
+                    msg = b'{"error": "forced"}'
+                    self.send_response(mode[1])
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(msg)))
+                    self.end_headers()
+                    if mode[1] != 204:
+                        self.wfile.write(msg)
+                    return
+                if mode == "nonobject":
+                    body = b"[1, 2, 3]"
+                elif mode == "incomplete":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body) + 500))
+                    self.end_headers()
+                    self.wfile.write(body[:5])
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -190,7 +240,7 @@ class ProxyHarness:
     """Boots cdp_proxy_grants against a fake Maestro + fake upstream on
     fresh module state each time (module-level globals reset via reload)."""
 
-    def __init__(self, maestro, upstream, poll_interval="0.1", shared_dir=None):
+    def __init__(self, maestro, upstream, poll_interval="0.1", shared_dir=None, clock=None):
         os.environ["BAS_TAILNET_IP"] = "127.0.0.1"
         os.environ["BAS_CDP_PORT"] = str(_free_port())
         os.environ["BAS_CHROME_CDP_PORT"] = str(upstream.port)
@@ -208,6 +258,11 @@ class ProxyHarness:
         else:
             import cdp_proxy_grants  # noqa: F401
         self.mod = cdp_proxy_grants
+        if clock is not None:
+            # Test-only injection point for the proxy's monotonic clock; set
+            # before any poll or accept thread starts so every timestamp the
+            # proxy takes comes from the controllable clock.
+            self.mod._monotonic = clock.now
         self.port = self.mod.PORT
 
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -635,6 +690,248 @@ class TestAuditLogging(unittest.TestCase):
 
         entries = [e for e in _read_audit_log(self.shared_dir) if e["event"] == "connection_rejected"]
         self.assertTrue(entries, "no connection_rejected audit entry was written")
+
+
+class FakeClock:
+    """Controllable monotonic clock injected into the proxy -- no sleeps."""
+
+    def __init__(self, start=1000.0):
+        self._t = start
+        self._lock = threading.Lock()
+
+    def now(self):
+        with self._lock:
+            return self._t
+
+    def advance(self, seconds):
+        with self._lock:
+            self._t += seconds
+
+
+# Far past any staleness bound the proxy can compute.
+BEYOND_ANY_BOUND = 3600
+
+
+class TestFailClosedOnStalePoll(unittest.TestCase):
+    """The module docstring promises the proxy authorizes nothing whenever
+    polling is failing. The original code kept that promise only BEFORE the
+    first successful poll: _poll_ok was set once and never cleared, so the
+    last-known grants were honored through any later outage. Every test here
+    therefore starts AFTER a successful poll, with a live grant that has
+    already been authorized once -- a cold-start test would pass against the
+    old code and prove nothing about this property."""
+
+    def setUp(self):
+        self.maestro = FakeMaestro()
+        self.upstream = FakeUpstream()
+        self.addCleanup(self.maestro.stop)
+        self.addCleanup(self.upstream.stop)
+        self.shared_dir = tempfile.mkdtemp(prefix="bas-test-shared-")
+        self.addCleanup(shutil.rmtree, self.shared_dir, ignore_errors=True)
+        self.clock = FakeClock()
+
+    def tearDown(self):
+        with contextlib.suppress(Exception):
+            self.harness.close()
+
+    # -- helpers ---------------------------------------------------------
+    def boot_with_live_grant(self, grants=None):
+        """Poll succeeds, a grant is live, and it is authorized once."""
+        if grants is None:
+            grant, token = make_grant()
+            grants = [(grant, token)]
+        self.grants = grants
+        self.maestro.set_grants([g for g, _ in grants])
+        self.harness = ProxyHarness(self.maestro, self.upstream, poll_interval="0.1",
+                                    shared_dir=self.shared_dir, clock=self.clock)
+        self.harness.wait_polled()
+        for _, token in grants:
+            self.assert_authorized(token)
+        return grants
+
+    def assert_authorized(self, token):
+        s = self.harness.connect_authorized(token=token)
+        try:
+            s.sendall(b"ping")
+            self.assertEqual(s.recv(4096), b"ping")
+        finally:
+            s.close()
+
+    def assert_refused(self, token):
+        s = self.harness.connect(token=token)
+        try:
+            self.assertIn(b"401", s.recv(4096))
+        finally:
+            s.close()
+
+    def wait_for_polls(self, n=3, timeout=5):
+        """Wait until the proxy has made n more requests of its own, so a
+        failure mode has demonstrably been hit (not merely configured)."""
+        target = self.maestro.request_count + n
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.maestro.request_count >= target:
+                return
+            time.sleep(0.02)
+        self.fail("proxy did not keep polling")
+
+    def wait_for_fresh_success(self, timeout=5):
+        """Wait for a poll that SUCCEEDED after this call began."""
+        self.maestro.mode = "ok"
+        start = self.maestro.request_count
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.maestro.request_count >= start + 2:
+                return
+            time.sleep(0.02)
+        self.fail("proxy did not poll after recovery")
+
+    def fail_polls_then_age_out(self, mode):
+        """Put Maestro into a failing mode, let the proxy hit it, then move
+        the clock far past the staleness bound."""
+        self.maestro.mode = mode
+        self.wait_for_polls()
+        self.clock.advance(BEYOND_ANY_BOUND)
+        # One more poll cycle so the proxy has seen the failure at the
+        # new time too.
+        self.wait_for_polls(2)
+
+    # -- one test per failure mode --------------------------------------
+    def test_maestro_unreachable_after_success_refuses_once_bound_passes(self):
+        [(grant, token)] = self.boot_with_live_grant()
+        self.maestro.go_down()
+        time.sleep(0.5)  # several 0.1s poll cycles hit a refused connection
+        self.clock.advance(BEYOND_ANY_BOUND)
+        time.sleep(0.3)
+        self.assert_refused(token)
+
+    def test_provider_credential_rejected_401_refuses_once_bound_passes(self):
+        [(grant, token)] = self.boot_with_live_grant()
+        self.fail_polls_then_age_out(("status", 401))
+        self.assert_refused(token)
+
+    def test_maestro_500_refuses_once_bound_passes(self):
+        [(grant, token)] = self.boot_with_live_grant()
+        self.fail_polls_then_age_out(("status", 500))
+        self.assert_refused(token)
+
+    def test_non_200_success_status_is_a_failed_poll(self):
+        """204 is a 2xx that urllib does not raise on. Only 200 is a poll."""
+        [(grant, token)] = self.boot_with_live_grant()
+        self.fail_polls_then_age_out(("status", 204))
+        self.assert_refused(token)
+
+    def test_redirect_is_a_failed_poll_and_is_never_followed(self):
+        [(grant, token)] = self.boot_with_live_grant()
+        self.fail_polls_then_age_out("redirect")
+        self.assertNotIn("/redirected", self.maestro.paths_seen,
+                         "poll followed a redirect (provider bearer token would travel with it)")
+        self.assert_refused(token)
+
+    def test_non_object_json_body_keeps_poll_thread_alive_and_fails_closed(self):
+        [(grant, token)] = self.boot_with_live_grant()
+        self.fail_polls_then_age_out("nonobject")
+        self.assertTrue(self.harness.poll_thread.is_alive(),
+                        "poll thread died on a non-object JSON body")
+        self.assert_refused(token)
+
+    def test_incomplete_read_keeps_poll_thread_alive_and_fails_closed(self):
+        [(grant, token)] = self.boot_with_live_grant()
+        self.fail_polls_then_age_out("incomplete")
+        self.assertTrue(self.harness.poll_thread.is_alive(),
+                        "poll thread died on http.client.IncompleteRead")
+        self.assert_refused(token)
+
+    def test_poll_thread_survives_any_exception_type(self):
+        """Not a list of types: an exception nobody anticipated."""
+        [(grant, token)] = self.boot_with_live_grant()
+
+        def boom(*a, **k):
+            raise RuntimeError("unanticipated")
+
+        self.harness.mod._fetch_grants = boom
+        time.sleep(0.5)  # several 0.1s poll cycles against the raising fetch
+        self.assertTrue(self.harness.poll_thread.is_alive())
+        self.clock.advance(BEYOND_ANY_BOUND)
+        time.sleep(0.3)
+        self.assertTrue(self.harness.poll_thread.is_alive())
+        self.assert_refused(token)
+
+    # -- the bound itself, tolerance, recovery, revoke -------------------
+    def test_staleness_bound_is_a_sane_constant(self):
+        self.boot_with_live_grant()
+        bound = getattr(self.harness.mod, "STALE_AFTER", None)
+        self.assertIsNotNone(bound, "no staleness bound exists")
+        mod = self.harness.mod
+        # Must cover the slowest healthy cadence: a poll that takes the whole
+        # timeout, then the sleep, then another such poll.
+        self.assertGreaterEqual(bound, 2 * (mod.POLL_INTERVAL + mod.POLL_TIMEOUT))
+        self.assertLessEqual(bound, 30, "bound must stay short enough for revoke to mean something")
+
+    def test_brief_outage_within_bound_keeps_live_grants(self):
+        """The cache is not cleared on a failed poll: one blip must not close
+        every live grant. Refusal is by age."""
+        [(grant, token)] = self.boot_with_live_grant()
+        self.maestro.mode = ("status", 500)
+        self.wait_for_polls()
+        self.assert_authorized(token)  # clock has not moved: still inside the bound
+
+    def test_recovery_after_outage_reauthorizes(self):
+        [(grant, token)] = self.boot_with_live_grant()
+        self.fail_polls_then_age_out(("status", 500))
+        self.assert_refused(token)
+        self.wait_for_fresh_success()
+        time.sleep(0.2)
+        self.assert_authorized(token)
+
+    def test_recovery_after_maestro_unreachable_reauthorizes(self):
+        [(grant, token)] = self.boot_with_live_grant()
+        self.maestro.go_down()
+        time.sleep(0.5)
+        self.clock.advance(BEYOND_ANY_BOUND)
+        time.sleep(0.3)
+        self.assert_refused(token)
+        self.maestro.come_up()
+        self.wait_for_fresh_success()
+        time.sleep(0.2)
+        self.assert_authorized(token)
+
+    def test_revoke_made_during_outage_is_refused_once_bound_passes(self):
+        [(grant, token)] = self.boot_with_live_grant()
+        # Revoke lands in Maestro, but the proxy cannot see it: polls fail.
+        revoked = dict(grant, revoked_at=datetime.now(timezone.utc).isoformat())
+        self.maestro.set_grants([revoked])
+        self.fail_polls_then_age_out(("status", 500))
+        self.assert_refused(token)
+        # Outage ends: the revoke is now observed directly, and stays refused.
+        self.wait_for_fresh_success()
+        time.sleep(0.2)
+        self.assert_refused(token)
+
+    # -- service_name ----------------------------------------------------
+    def test_service_name_is_audit_scope_not_an_authorization_check(self):
+        """Decision: a grant is authorized by token hash, provider scoping
+        and liveness. The proxy fronts one shared browser profile and has no
+        service identity of its own to compare against, so a grant for any
+        service_name is honored and recorded under its own name."""
+        g1, t1 = make_grant(service_name="tradingview")
+        g2, t2 = make_grant(service_name="some-other-service")
+        self.boot_with_live_grant([(g1, t1), (g2, t2)])
+        accepted = {e["service"] for e in _read_audit_log(self.shared_dir)
+                    if e["event"] == "connection_accepted"}
+        self.assertEqual(accepted, {"tradingview", "some-other-service"})
+
+    # -- logging ---------------------------------------------------------
+    def test_failed_poll_logs_kind_never_the_provider_credential(self):
+        [(grant, token)] = self.boot_with_live_grant()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.maestro.mode = ("status", 401)
+            self.wait_for_polls()
+        out = buf.getvalue()
+        self.assertIn("grants poll failed", out)
+        self.assertNotIn("provider-registration-token", out)
+        self.assertNotIn(token, out)
 
 
 if __name__ == "__main__":
